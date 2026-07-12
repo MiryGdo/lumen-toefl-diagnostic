@@ -625,7 +625,7 @@ label{display:block;font-size:12px;font-weight:600;color:var(--ink-dim);
 const SUPABASE_URL = "https://zcrwqnuhvierehwufoot.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_3BJ-DndFIMyReo9fxLiWWg_lakjyoh8";
 const API_PROXY_ENDPOINT = ""; // Producción: URL de tu backend seguro, nunca la API key en el HTML.
-const RECS_PROXY_ENDPOINT = ""; // v3.1: recomendaciones + mini guía (Gemini gratis). Vacío = usa respaldo local.
+const RECS_PROXY_ENDPOINT = "https://zcrwqnuhvierehwufoot.supabase.co/functions/v1/STUDY-RECOMENDATIONS"; // v3.1: recomendaciones + mini guía (Gemini gratis). Vacío = usa respaldo local.
 let supabaseClient = null;
 let currentUser = null;
 

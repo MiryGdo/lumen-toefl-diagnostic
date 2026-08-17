@@ -615,7 +615,11 @@ label{display:block;font-size:12px;font-weight:600;color:var(--ink-dim);
 <script src="audio/manifest.js" onerror="this.remove()"></script><!-- v3.1: audios ElevenLabs pregrabados (opcional; si no existe, se usa Google TTS) -->
 <script>
 /* ===========================================================================
- * TOEFL DIAGNOSTIC AI APP · MVP v2
+ * TOEFL DIAGNOSTIC AI APP · v4
+ *   - Escala CEFR recalibrada + ponderación por dificultad + techos de evidencia
+ *   - Bancos ampliados con pools exam/practice (Modo C usa ítems distintos)
+ *   - Autoguardado real en localStorage (sin login) con reanudación
+ *   - Pantalla de revisión de errores post-examen
  * Specification source: Documento Maestro v2 + Marco de Desarrollo v2
  * ===========================================================================
  */
@@ -638,20 +642,43 @@ const L1_DOMAINS = {
   pragmatic:    "Pragmático y registro"
 };
 
-/* CEFR → band mapping (sección 10.3 del Doc Maestro) */
+/* CEFR → band mapping · v4: escala recalibrada (más estricta que el Doc Maestro 10.3)
+ * Motivo: con la escala v3 (C1 desde 76%), alumnos B1 alcanzaban C1 por la
+ * proporción de ítems fáciles. v4 sube los umbrales Y pondera por dificultad
+ * (ver scoreSection), de modo que C1+ exige evidencia real en ítems difíciles. */
+const BAND_TABLE = [
+  {min:97, band:6.0, cefr:"C2",   desc:"Maestría"},
+  {min:91, band:5.5, cefr:"C1.2", desc:"Avanzado alto"},
+  {min:84, band:5.0, cefr:"C1.1", desc:"Avanzado bajo"},
+  {min:73, band:4.5, cefr:"B2.2", desc:"Intermedio alto"},
+  {min:62, band:4.0, cefr:"B2.1", desc:"Intermedio estándar"},
+  {min:52, band:3.5, cefr:"B1.2", desc:"Pre-intermedio alto"},
+  {min:42, band:3.0, cefr:"B1.1", desc:"Pre-intermedio estándar"},
+  {min:30, band:2.5, cefr:"A2.2", desc:"Básico alto"},
+  {min:18, band:2.0, cefr:"A2.1", desc:"Básico estándar"},
+  {min: 8, band:1.5, cefr:"A1.2", desc:"Principiante alto"},
+  {min: 0, band:1.0, cefr:"A1.1", desc:"Principiante básico"}
+];
 function rawToBand(raw){
-  if(raw>=96) return {band:6.0, cefr:"C2",   desc:"Maestría"};
-  if(raw>=86) return {band:5.5, cefr:"C1.2", desc:"Avanzado alto"};
-  if(raw>=76) return {band:5.0, cefr:"C1.1", desc:"Avanzado bajo"};
-  if(raw>=66) return {band:4.5, cefr:"B2.2", desc:"Intermedio alto"};
-  if(raw>=56) return {band:4.0, cefr:"B2.1", desc:"Intermedio estándar"};
-  if(raw>=46) return {band:3.5, cefr:"B1.2", desc:"Pre-intermedio alto"};
-  if(raw>=36) return {band:3.0, cefr:"B1.1", desc:"Pre-intermedio estándar"};
-  if(raw>=26) return {band:2.5, cefr:"A2.2", desc:"Básico alto"};
-  if(raw>=16) return {band:2.0, cefr:"A2.1", desc:"Básico estándar"};
-  if(raw>= 6) return {band:1.5, cefr:"A1.2", desc:"Principiante alto"};
-  return        {band:1.0, cefr:"A1.1", desc:"Principiante básico"};
+  for(const row of BAND_TABLE){
+    if(raw >= row.min) return {band:row.band, cefr:row.cefr, desc:row.desc};
+  }
+  return {band:1.0, cefr:"A1.1", desc:"Principiante básico"};
 }
+/* Devuelve la fila de banda más alta que no exceda maxBand (para techos de evidencia) */
+function capBandTo(banding, maxBand){
+  if(banding.band <= maxBand) return banding;
+  const row = BAND_TABLE.find(r => r.band <= maxBand) || BAND_TABLE[BAND_TABLE.length-1];
+  return {band:row.band, cefr:row.cefr, desc:row.desc, capped:true};
+}
+/* Mapea un valor de banda (1.0–6.0) a su fila CEFR, sin pasar por porcentaje */
+function bandValueToCefr(bandValue){
+  const rounded = Math.round(bandValue*2)/2;
+  const row = BAND_TABLE.find(r => r.band <= rounded) || BAND_TABLE[BAND_TABLE.length-1];
+  return {band:row.band, cefr:row.cefr, desc:row.desc};
+}
+/* Ponderación por dificultad del ítem: acertar ítems difíciles vale más */
+const DIFF_WEIGHT = {easy:1.0, medium:1.5, hard:2.1};
 
 /* Ponderación diagnóstica (sección 1.3.1) */
 const WEIGHTS = {Listening:0.20, Reading:0.20, Grammar:0.25, Spelling:0.15, Writing:0.20};
@@ -664,8 +691,8 @@ const MODE_CONFIG = {
   B: {label:"Rápido", durationMin:30,
       counts:{Listening:3, Reading:1, Grammar:6, Spelling:3, Writing:1},
       sections:["Listening","Reading","Grammar","Spelling","Writing"]},
-  C: {label:"Por habilidad", durationMin:20,
-      counts:{Listening:5, Reading:1, Grammar:8, Spelling:5, Writing:1},
+  C: {label:"Por habilidad", durationMin:25,
+      counts:{Listening:6, Reading:1, Grammar:10, Spelling:6, Writing:1},
       sections:[]}
 };
 
@@ -798,15 +825,15 @@ const LISTENING_BANK = [
         id:"lis_lec_b2_001_q2", question_type:"vocabulary_in_context",
         prompt:"When the speaker says 'actually argue', what does 'actually' mean?",
         options:[
-          {text:"In fact, in reality.", is_correct:true,
-           rationale:"Correcto. 'Actually' significa 'en realidad', enfatiza un hecho contraintuitivo."},
-          {text:"Currently, at this moment.", is_correct:false,
+      {text:"Currently, at this moment.", is_correct:false,
            rationale:"Falso cognado clásico: 'actually' NO es 'actualmente'.", l1_trigger:"lexical"},
-          {text:"Frequently, often.", is_correct:false,
+      {text:"In fact, in reality.", is_correct:true,
+           rationale:"Correcto. 'Actually' significa 'en realidad', enfatiza un hecho contraintuitivo."},
+      {text:"Frequently, often.", is_correct:false,
            rationale:"Distractor sin base léxica."},
-          {text:"Sometimes, occasionally.", is_correct:false,
+      {text:"Sometimes, occasionally.", is_correct:false,
            rationale:"Distractor sin base léxica."}
-        ]
+    ]
       }
     ]
   },
@@ -820,15 +847,334 @@ const LISTENING_BANK = [
       id:"lis_sr_b1_002_q1", question_type:"function",
       prompt:"What is the speaker's primary purpose?",
       options:[
-        {text:"To apologize and ask for a new appointment.", is_correct:true,
-         rationale:"Correcto. Pide disculpas y propone reagendar."},
-        {text:"To complain about the bus service.", is_correct:false,
-         rationale:"Distractor. Menciona el bus como contexto, no como queja principal."},
-        {text:"To cancel the appointment permanently.", is_correct:false,
+      {text:"To cancel the appointment permanently.", is_correct:false,
          rationale:"Distractor. Propone reagendar, no cancelar."},
-        {text:"To request a different professor.", is_correct:false,
+      {text:"To complain about the bus service.", is_correct:false,
+         rationale:"Distractor. Menciona el bus como contexto, no como queja principal."},
+      {text:"To apologize and ask for a new appointment.", is_correct:true,
+         rationale:"Correcto. Pide disculpas y propone reagendar."},
+      {text:"To request a different professor.", is_correct:false,
          rationale:"Distractor sin base."}
+    ]
+    }]
+  },
+
+  {
+    id:"lis_sr_a2_002", section:"Listening", audio_type:"short_response", pool:"exam",
+    cefr_level:"A2.2", difficulty:"easy", l1_domains:["pragmatic"],
+    title:"Bus Schedule Change",
+    script:"Hi, sorry to bother you. I usually take the number twelve bus to campus, but the sign says it doesn't stop here anymore. Do you know where the new stop is?",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_a2_002_q1", question_type:"detail",
+      prompt:"What does the speaker want to know?",
+      options:[
+        {text:"What time the bus leaves.", is_correct:false,
+         rationale:"Distractor. No pregunta por el horario, sino por la ubicación."},
+        {text:"How much the ticket costs.", is_correct:false,
+         rationale:"Distractor. No se menciona el precio."},
+        {text:"Where the new bus stop is located.", is_correct:true,
+         rationale:"Correcto. Pregunta literalmente 'where the new stop is'."},
+        {text:"Which bus goes downtown.", is_correct:false,
+         rationale:"Distractor. El destino es el campus, no el centro.", l1_trigger:"phonological"}
       ]
+    }]
+  },
+  {
+    id:"lis_ann_b1_002", section:"Listening", audio_type:"announcement", pool:"exam",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["lexical"],
+    title:"Museum Gallery Relocation",
+    script:"May I have your attention, please. Starting this afternoon, the photography exhibition will be moved from the second floor to the west wing on the ground floor. The second-floor galleries will remain closed for maintenance until the end of the month. We apologize for any inconvenience.",
+    accent:"en-US",
+    questions:[{
+      id:"lis_ann_b1_002_q1", question_type:"detail",
+      prompt:"Where can visitors see the photography exhibition this afternoon?",
+      options:[
+        {text:"On the second floor.", is_correct:false,
+         rationale:"Distractor. Esa era la ubicación anterior."},
+        {text:"In the west wing on the ground floor.", is_correct:true,
+         rationale:"Correcto. El anuncio dice que la exhibición se mueve al ala oeste de la planta baja."},
+        {text:"In the maintenance area.", is_correct:false,
+         rationale:"Distractor. El mantenimiento es la razón del cierre, no una ubicación para visitantes."},
+        {text:"Outside the museum until next month.", is_correct:false,
+         rationale:"Distractor. Nada indica que salga del museo.", l1_trigger:"lexical"}
+      ]
+    }]
+  },
+  {
+    id:"lis_sr_b1_003", section:"Listening", audio_type:"short_response", pool:"exam",
+    cefr_level:"B1.1", difficulty:"easy", l1_domains:["pragmatic"],
+    title:"Gym Membership Freeze",
+    script:"Good morning. I'll be traveling for work during all of March, so I'd like to pause my gym membership for that month instead of canceling it completely. Is that something you can do?",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_b1_003_q1", question_type:"main_idea",
+      prompt:"What does the speaker want to do?",
+      options:[
+        {text:"Cancel his membership permanently.", is_correct:false,
+         rationale:"Distractor. Dice explícitamente 'instead of canceling'."},
+        {text:"Sign up for a new membership.", is_correct:false,
+         rationale:"Distractor. Ya es miembro."},
+        {text:"Complain about the gym's prices.", is_correct:false,
+         rationale:"Distractor. No menciona precios."},
+        {text:"Temporarily suspend his membership.", is_correct:true,
+         rationale:"Correcto. 'Pause my membership for that month' = suspensión temporal."}
+      ]
+    }]
+  },
+  {
+    id:"lis_sr_b2_003", section:"Listening", audio_type:"short_response", pool:"exam",
+    cefr_level:"B2.1", difficulty:"medium", l1_domains:["pragmatic","phonological"],
+    title:"Office Hours Conflict",
+    script:"Professor, I was planning to come to your office hours on Thursday to go over my thesis outline, but I just found out I have a mandatory lab session at the same time. Would it be possible to meet earlier that day, or perhaps on Friday morning instead?",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_b2_003_q1", question_type:"inference",
+      prompt:"What can be inferred about the student?",
+      options:[
+      {text:"He missed the professor's office hours last week.", is_correct:false,
+         rationale:"Distractor. No se menciona la semana pasada.", l1_trigger:"phonological"},
+      {text:"He has already finished his thesis.", is_correct:false,
+         rationale:"Distractor. Solo tiene un 'outline' (esquema)."},
+      {text:"He wants to skip his lab session.", is_correct:false,
+         rationale:"Distractor. La sesión es 'mandatory' y busca mover la otra cita."},
+      {text:"He wants to reschedule a meeting because of a schedule conflict.", is_correct:true,
+         rationale:"Correcto. Propone alternativas porque su laboratorio coincide con las office hours."}
+    ]
+    }]
+  },
+  {
+    id:"lis_con_b2_002", section:"Listening", audio_type:"conversation", pool:"exam",
+    cefr_level:"B2.2", difficulty:"hard", l1_domains:["pragmatic","lexical"],
+    title:"Changing Majors",
+    script:"Student: I've been thinking about switching from chemistry to environmental science, but I'm worried I'd lose too many credits. Advisor: Not necessarily. Several of your chemistry courses would count toward the environmental science core, so you'd only be about one semester behind. Student: One semester I could live with. What worries me more is the field work requirement — I work part-time on weekends. Advisor: That's a fair concern. The field modules run mostly on weekends in the spring. You might need to talk to your employer before you commit to anything.",
+    accent:"en-US",
+    questions:[
+      {
+        id:"lis_con_b2_002_q1", question_type:"main_idea",
+        prompt:"What is the conversation mainly about?",
+        options:[
+          {text:"The student's part-time job responsibilities.", is_correct:false,
+           rationale:"Distractor. El trabajo es una preocupación secundaria."},
+          {text:"Whether the student should change to a different major.", is_correct:true,
+           rationale:"Correcto. Todo gira en torno a cambiar de chemistry a environmental science."},
+          {text:"How to register for spring field modules.", is_correct:false,
+           rationale:"Distractor. Los módulos se mencionan, pero no el registro."},
+          {text:"The advisor's opinion of the chemistry department.", is_correct:false,
+           rationale:"Distractor. El asesor no opina del departamento."}
+        ]
+      },
+      {
+        id:"lis_con_b2_002_q2", question_type:"inference",
+        prompt:"What is the student's biggest remaining concern at the end of the conversation?",
+        options:[
+          {text:"Losing too many academic credits.", is_correct:false,
+           rationale:"Distractor. Esa preocupación queda resuelta ('one semester I could live with')."},
+          {text:"Failing the chemistry core courses.", is_correct:false,
+           rationale:"Distractor. No se habla de reprobar."},
+          {text:"A conflict between field work and his weekend job.", is_correct:true,
+           rationale:"Correcto. 'What worries me more is the field work requirement — I work part-time on weekends.'"},
+          {text:"Choosing an employer after graduation.", is_correct:false,
+           rationale:"Distractor. 'Employer' aparece, pero se refiere a su empleo actual.", l1_trigger:"lexical"}
+        ]
+      }
+    ]
+  },
+  {
+    id:"lis_lec_c1_001", section:"Listening", audio_type:"mini_lecture", pool:"exam",
+    cefr_level:"C1.1", difficulty:"hard", l1_domains:["lexical","pragmatic"],
+    title:"The Coffee Ring Effect",
+    script:"Today I want to talk about something you've all seen but probably never questioned: why a drop of spilled coffee dries with a dark ring around the edge instead of an even stain. Physicists call this the coffee ring effect. When a droplet sits on a surface, its edge becomes pinned in place, meaning the outline of the drop cannot shrink as the water evaporates. Evaporation, however, is fastest at that thin outer edge. To replace the liquid lost there, water flows outward from the center of the drop, and it carries the suspended coffee particles along with it. The particles accumulate at the boundary and, once the water is gone, they remain as the familiar ring. Now, why should anyone beyond coffee drinkers care? Because the same mechanism complicates industrial processes like inkjet printing and the manufacture of certain medical tests, where engineers need particles to settle evenly rather than pile up at the edges. Much of the research in this area is devoted precisely to defeating the coffee ring effect.",
+    accent:"en-US",
+    questions:[
+      {
+        id:"lis_lec_c1_001_q1", question_type:"main_idea",
+        prompt:"What is the lecture mainly about?",
+        options:[
+          {text:"The chemistry of coffee beans.", is_correct:false,
+           rationale:"Distractor. El café es solo el ejemplo cotidiano."},
+          {text:"How inkjet printers were invented.", is_correct:false,
+           rationale:"Distractor. La impresión es una aplicación mencionada al final."},
+          {text:"Why evaporating droplets leave a ring of particles at their edge.", is_correct:true,
+           rationale:"Correcto. Explica el mecanismo físico del 'coffee ring effect'."},
+          {text:"Methods for cleaning coffee stains.", is_correct:false,
+           rationale:"Distractor sin base en el audio."}
+        ]
+      },
+      {
+        id:"lis_lec_c1_001_q2", question_type:"detail",
+        prompt:"According to the lecture, why do particles move toward the edge of the drop?",
+        options:[
+      {text:"The center of the drop evaporates first.", is_correct:false,
+           rationale:"Distractor. Es lo contrario: la evaporación es más rápida en el borde."},
+      {text:"The particles are heavier than water and sink to the sides.", is_correct:false,
+           rationale:"Distractor. No se menciona el peso de las partículas."},
+      {text:"The surface tension pushes particles from below.", is_correct:false,
+           rationale:"Distractor plausible pero no dicho en el audio."},
+      {text:"The edge of the drop is pinned and evaporation is fastest there, so water flows outward carrying particles.", is_correct:true,
+         rationale:"Correcto. Es la cadena causal completa que da el profesor."}
+    ]
+      }
+    ]
+  },
+
+  /* ---- pool practice (Modo C · evaluación por habilidad) ---- */
+  {
+    id:"lis_sr_a2_003", section:"Listening", audio_type:"short_response", pool:"practice",
+    cefr_level:"A2.2", difficulty:"easy", l1_domains:["pragmatic"],
+    title:"Lost Umbrella",
+    script:"Hello, I think I left my umbrella in the reading room this morning. It's blue with a wooden handle. Has anyone turned it in at the front desk?",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_a2_003_q1", question_type:"detail",
+      prompt:"Why is the speaker at the front desk?",
+      options:[
+      {text:"To report a broken window.", is_correct:false,
+         rationale:"Distractor sin base en el audio."},
+      {text:"To return a book to the library.", is_correct:false,
+         rationale:"Distractor. No menciona libros."},
+      {text:"To buy a new umbrella.", is_correct:false,
+         rationale:"Distractor. Busca el suyo, no comprar otro."},
+      {text:"To ask about a lost umbrella.", is_correct:true,
+         rationale:"Correcto. Perdió su paraguas y pregunta si alguien lo entregó."}
+    ]
+    }]
+  },
+  {
+    id:"lis_ann_b2_001", section:"Listening", audio_type:"announcement", pool:"practice",
+    cefr_level:"B2.1", difficulty:"medium", l1_domains:["lexical","pragmatic"],
+    title:"Gate Change Announcement",
+    script:"Attention passengers on flight seven-four-two to Denver. Due to an aircraft change, boarding will now take place at gate C eleven instead of gate B four. Boarding will begin in approximately twenty minutes, starting with passengers who require additional assistance, followed by group one. Please have your boarding pass ready.",
+    accent:"en-US",
+    questions:[{
+      id:"lis_ann_b2_001_q1", question_type:"detail",
+      prompt:"What change does the announcement describe?",
+      options:[
+        {text:"The flight has been canceled.", is_correct:false,
+         rationale:"Distractor. El vuelo sigue; cambia la puerta."},
+        {text:"The flight will now board at a different gate.", is_correct:true,
+         rationale:"Correcto. De la puerta B4 a la C11 por cambio de aeronave."},
+        {text:"The destination has changed to Denver.", is_correct:false,
+         rationale:"Distractor. Denver siempre fue el destino."},
+        {text:"Boarding will begin two hours late.", is_correct:false,
+         rationale:"Distractor. Son unos veinte minutos, no dos horas.", l1_trigger:"phonological"}
+      ]
+    }]
+  },
+  {
+    id:"lis_con_b1_001", section:"Listening", audio_type:"conversation", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["pragmatic"],
+    title:"Planning a Study Group",
+    script:"Woman: Are you free on Wednesday evening? A few of us are starting a study group for the history midterm. Man: Wednesday is tough for me — I have soccer practice until seven. Could we start at seven thirty? Woman: That works. We're meeting in the small room next to the campus cafe, the one with the whiteboard. Man: Perfect. Should I bring anything? Woman: Just your lecture notes. Sarah is printing the review questions for everyone.",
+    accent:"en-US",
+    questions:[
+      {
+        id:"lis_con_b1_001_q1", question_type:"detail",
+        prompt:"Why can't the man meet before 7:30?",
+        options:[
+          {text:"He has a history lecture.", is_correct:false,
+           rationale:"Distractor. La materia del examen es historia, pero su conflicto no."},
+          {text:"He works at the campus cafe.", is_correct:false,
+           rationale:"Distractor. El café es solo el punto de referencia del lugar."},
+          {text:"He has soccer practice until seven.", is_correct:true,
+           rationale:"Correcto. Lo dice explícitamente."},
+          {text:"He needs to print review questions.", is_correct:false,
+           rationale:"Distractor. Eso lo hará Sarah."}
+        ]
+      },
+      {
+        id:"lis_con_b1_001_q2", question_type:"detail",
+        prompt:"What should the man bring to the meeting?",
+        options:[
+          {text:"A whiteboard.", is_correct:false,
+           rationale:"Distractor. El salón ya tiene whiteboard."},
+          {text:"His lecture notes.", is_correct:true,
+           rationale:"Correcto. 'Just your lecture notes.'"},
+          {text:"Printed review questions.", is_correct:false,
+           rationale:"Distractor. Las imprime Sarah."},
+          {text:"Coffee for everyone.", is_correct:false,
+           rationale:"Distractor sin base en el audio."}
+        ]
+      }
+    ]
+  },
+  {
+    id:"lis_lec_b2_002", section:"Listening", audio_type:"mini_lecture", pool:"practice",
+    cefr_level:"B2.2", difficulty:"hard", l1_domains:["lexical"],
+    title:"The Invention of Canned Food",
+    script:"Here's a question for you: which came first, the canned food or the can opener? The answer sounds like a joke, but it's the canned food — by almost fifty years. In the early eighteen hundreds, the French government offered a cash prize to anyone who could develop a reliable way to preserve food for soldiers on long campaigns. A confectioner named Nicolas Appert discovered that food sealed in airtight glass containers and then heated would keep for months. Soon after, the method was adapted to metal cans, which were cheaper and far less fragile than glass. There was just one problem: nobody had designed a convenient tool for opening them. For decades, instructions on cans told people to use a hammer and chisel. It wasn't until the eighteen fifties that inventors patented openers that resembled the ones we use today. The lesson I want you to take from this story is that technologies rarely arrive as complete systems. One invention often creates the need for another.",
+    accent:"en-US",
+    questions:[
+      {
+        id:"lis_lec_b2_002_q1", question_type:"detail",
+        prompt:"According to the lecture, how did people open cans before can openers existed?",
+        options:[
+          {text:"They returned the cans to the factory.", is_correct:false,
+           rationale:"Distractor. No se menciona devolver latas a la fábrica."},
+          {text:"They asked a blacksmith to cut them.", is_correct:false,
+           rationale:"Distractor. No se menciona."},
+          {text:"Using a hammer and a chisel, as the instructions said.", is_correct:true,
+           rationale:"Correcto. 'Instructions on cans told people to use a hammer and chisel.'"},
+          {text:"By heating the can until it opened.", is_correct:false,
+           rationale:"Distractor. El calor era parte de la conservación, no de la apertura."}
+        ]
+      },
+      {
+        id:"lis_lec_b2_002_q2", question_type:"main_idea",
+        prompt:"What is the main lesson of the lecture?",
+        options:[
+          {text:"French food preservation was superior to other methods.", is_correct:false,
+           rationale:"Distractor. No hay comparación entre países."},
+          {text:"Glass containers are more reliable than metal cans.", is_correct:false,
+           rationale:"Distractor. Se dice lo contrario sobre fragilidad."},
+          {text:"Military needs slow down technological progress.", is_correct:false,
+           rationale:"Distractor. La necesidad militar impulsó el invento."},
+          {text:"New technologies often create the need for further inventions.", is_correct:true,
+           rationale:"Correcto. Es la conclusión explícita del profesor."}
+        ]
+      }
+    ]
+  },
+  {
+    id:"lis_sr_b2_004", section:"Listening", audio_type:"short_response", pool:"practice",
+    cefr_level:"B2.1", difficulty:"medium", l1_domains:["pragmatic"],
+    title:"Shift Swap Request",
+    script:"Hey, Dana. I know it's short notice, but my brother's graduation is this Saturday. If you could cover my morning shift, I'd be happy to take your closing shift next weekend — or any other day that works better for you.",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_b2_004_q1", question_type:"main_idea",
+      prompt:"What is the speaker offering to do?",
+      options:[
+        {text:"Pay Dana for working on Saturday.", is_correct:false,
+         rationale:"Distractor. No ofrece dinero, ofrece un intercambio."},
+        {text:"Work one of Dana's shifts in exchange for this Saturday.", is_correct:true,
+         rationale:"Correcto. Propone cubrir el 'closing shift' de Dana a cambio."},
+        {text:"Attend Dana's graduation ceremony.", is_correct:false,
+         rationale:"Distractor. La graduación es de su hermano."},
+        {text:"Quit his morning shift permanently.", is_correct:false,
+         rationale:"Distractor. Es un cambio puntual, no permanente."}
+      ]
+    }]
+  },
+  {
+    id:"lis_sr_c1_001", section:"Listening", audio_type:"short_response", pool:"practice",
+    cefr_level:"C1.1", difficulty:"hard", l1_domains:["pragmatic"],
+    title:"Recommendation Letter Request",
+    script:"Professor Vega, I realize this is a significant request given how full your schedule must be, but I'm applying to a graduate program in linguistics and the deadline is in three weeks. If you feel you know my work well enough from your seminar, I'd be honored if you'd consider writing me a letter of recommendation. Of course, I completely understand if the timing doesn't work.",
+    accent:"en-US",
+    questions:[{
+      id:"lis_sr_c1_001_q1", question_type:"inference",
+      prompt:"Why does the speaker say 'I completely understand if the timing doesn't work'?",
+      options:[
+      {text:"To criticize the professor's busy schedule.", is_correct:false,
+         rationale:"Distractor. Reconocer la agenda llena es cortesía, no crítica.", l1_trigger:"pragmatic"},
+      {text:"Because she wants to withdraw her request.", is_correct:false,
+         rationale:"Distractor. Sigue queriendo la carta; solo suaviza la petición."},
+      {text:"Because the application deadline has already passed.", is_correct:false,
+         rationale:"Distractor. Faltan tres semanas para el cierre."},
+      {text:"To politely give the professor an easy way to decline.", is_correct:true,
+         rationale:"Correcto. Es una estrategia de cortesía: reduce la presión sobre el profesor."}
+    ]
     }]
   }
 ];
@@ -930,6 +1276,205 @@ This ecological destabilization highlights a critical point: trophic cascades ar
           {text:"To describe the discovery of phytoplankton.", is_correct:false,
            rationale:"Distractor. No es histórico."}
         ]
+      }
+    ]
+  },
+
+  {
+    id:"read_pass_b2_002", section:"Reading", pool:"exam",
+    cefr_level:"B2.2", difficulty:"hard",
+    title:"Light Without Heat: Deep-Sea Bioluminescence",
+    field:"biology",
+    word_count:298,
+    text:`Below roughly one thousand meters, sunlight never reaches the ocean, yet the deep sea is far from dark. An estimated three quarters of the animals living there can produce their own light through a chemical reaction between a molecule called luciferin and an enzyme known as luciferase. <span class="pos">[1]</span> Unlike an incandescent bulb, which wastes most of its energy as heat, this biological reaction is remarkably efficient: nearly all of the energy released emerges as visible light.
+
+The functions of bioluminescence are surprisingly diverse. Some anglerfish dangle a glowing lure to attract prey close enough to capture, while certain species of squid release luminous clouds to confuse predators before escaping into the darkness. <span class="pos">[2]</span> Perhaps the most <span class="l1-trap" title="Falso cognado: 'sensible' = 'sensato/razonable', no 'sensible' (ES)">sensible</span> strategy, however, belongs to animals that use light to hide. Through a mechanism called counter-illumination, hatchetfish generate a faint glow on their undersides that matches the dim light filtering down from above, effectively erasing their silhouette when viewed from below. <span class="pos">[3]</span>
+
+Marine biologists argue that bioluminescence has evolved independently dozens of times, which suggests that producing light offers substantial survival advantages in permanently dark habitats. <span class="pos">[4]</span> Research into these natural light systems has already proved useful on land: modified luciferase genes are now standard tools in medical laboratories, where they allow scientists to watch, in real time, whether particular genes inside living cells are active. What began as a curiosity of the deep sea has <span class="l1-trap" title="Falso cognado: 'ultimately' = 'finalmente/en última instancia', no 'últimamente'">ultimately</span> become an everyday instrument of biomedical research.`,
+    insertion_sentence:"This ability to vanish in open water makes them extraordinarily difficult for hunters to detect.",
+    questions:[
+      {
+        id:"read_pass_b2_002_q1", question_type:"main_idea",
+        prompt:"What is the main idea of the passage?",
+        options:[
+          {text:"Anglerfish are the most dangerous predators of the deep sea.", is_correct:false,
+           rationale:"Distractor. El anglerfish es solo un ejemplo."},
+          {text:"Bioluminescence serves many survival functions and has even become useful in medical research.", is_correct:true,
+           rationale:"Correcto. Cubre las funciones diversas y la aplicación biomédica final."},
+          {text:"Sunlight cannot reach below one thousand meters of ocean.", is_correct:false,
+           rationale:"Distractor. Es un dato introductorio, no la tesis."},
+          {text:"Incandescent bulbs are less efficient than fluorescent ones.", is_correct:false,
+           rationale:"Distractor. El foco es una comparación breve, no el tema."}
+        ]
+      },
+      {
+        id:"read_pass_b2_002_q2", question_type:"vocabulary_in_context",
+        prompt:'In paragraph 2, the word "sensible" most closely means:',
+        options:[
+          {text:"emotionally sensitive", is_correct:false,
+           rationale:"Falso cognado directo: 'sensible' (ES) = 'sensitive' (EN), no 'sensible'.", l1_trigger:"lexical"},
+          {text:"reasonable, showing good judgment", is_correct:true,
+           rationale:"Correcto. 'Sensible' en inglés = sensato, razonable."},
+          {text:"easily visible", is_correct:false,
+           rationale:"Distractor temático (luz/visibilidad) sin base léxica."},
+          {text:"extremely fragile", is_correct:false,
+           rationale:"Distractor sin base léxica."}
+        ]
+      },
+      {
+        id:"read_pass_b2_002_q3", question_type:"insertion",
+        prompt:'Where would the following sentence best fit?<br><em>"This ability to vanish in open water makes them extraordinarily difficult for hunters to detect."</em>',
+        options:[
+          {text:"Position [1]", is_correct:false,
+           rationale:"No: ahí se explica la química, no el camuflaje."},
+          {text:"Position [2]", is_correct:false,
+           rationale:"No: interrumpe la lista de funciones antes de introducir la contra-iluminación."},
+          {text:"Position [3]", is_correct:true,
+           rationale:"Correcto. Sigue inmediatamente a la explicación de cómo el hatchetfish borra su silueta."},
+          {text:"Position [4]", is_correct:false,
+           rationale:"No: el texto ya cambió al tema de la evolución independiente."}
+        ]
+      },
+      {
+        id:"read_pass_b2_002_q4", question_type:"detail",
+        prompt:"According to the passage, what is counter-illumination?",
+        options:[
+          {text:"A glowing lure used to attract prey.", is_correct:false,
+           rationale:"Distractor. Esa es la estrategia del anglerfish."},
+          {text:"A luminous cloud released to confuse predators.", is_correct:false,
+           rationale:"Distractor. Esa es la estrategia del calamar."},
+          {text:"A chemical reaction between luciferin and luciferase.", is_correct:false,
+           rationale:"Distractor. Esa es la base química general, no la estrategia."},
+          {text:"A faint glow that matches light from above and erases the animal's silhouette.", is_correct:true,
+           rationale:"Correcto. Es la definición literal dada para el hatchetfish."}
+        ]
+      },
+      {
+        id:"read_pass_b2_002_q5", question_type:"inference",
+        prompt:"What can be inferred from the fact that bioluminescence evolved independently dozens of times?",
+        options:[
+      {text:"Bioluminescence will soon disappear from the deep sea.", is_correct:false,
+           rationale:"Distractor sin base en el texto."},
+      {text:"All deep-sea species descend from a single glowing ancestor.", is_correct:false,
+           rationale:"Distractor. 'Independently' implica exactamente lo contrario."},
+      {text:"Producing light gives major survival benefits in dark habitats.", is_correct:true,
+           rationale:"Correcto. El pasaje lo presenta como la conclusión de los biólogos."},
+      {text:"Only fish are capable of producing light.", is_correct:false,
+           rationale:"Distractor. También se mencionan calamares."}
+    ]
+      },
+      {
+        id:"read_pass_b2_002_q6", question_type:"rhetorical_purpose",
+        prompt:"Why does the author mention medical laboratories in the final paragraph?",
+        options:[
+      {text:"To show a practical application of a natural phenomenon beyond the ocean.", is_correct:true,
+           rationale:"Correcto. Ilustra cómo la luciferasa se volvió herramienta biomédica."},
+      {text:"To argue that deep-sea research receives too little funding.", is_correct:false,
+           rationale:"Distractor. No se habla de financiamiento."},
+      {text:"To compare hospitals with marine laboratories.", is_correct:false,
+           rationale:"Distractor. No hay tal comparación."},
+      {text:"To explain how genes evolve in living cells.", is_correct:false,
+           rationale:"Distractor. Los genes se observan, no se explica su evolución."}
+    ]
+      }
+    ]
+  },
+  {
+    id:"read_pass_b1_001", section:"Reading", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium",
+    title:"Railway Time: How Trains Standardized the Clock",
+    field:"history",
+    word_count:274,
+    text:`Before the middle of the nineteenth century, every town kept its own time. Clocks were set by the position of the sun, so noon in one city could be several minutes earlier or later than noon in a neighboring one. <span class="pos">[1]</span> For centuries this caused no serious problems, because travel between towns was slow and schedules did not need to be precise.
+
+The arrival of the railway changed everything. Trains moved fast enough to cross several local time zones in a single afternoon, and railway companies needed timetables that passengers in different cities could all understand. <span class="pos">[2]</span> A train that left London at what one station called two o'clock might arrive at a station whose clocks showed a completely different hour. Missed connections were common, and in the worst cases, two trains could be scheduled onto the same track at the same moment.
+
+To solve this, British railway companies began adopting a single standard time, based on the clock at Greenwich, for all their stations and timetables. <span class="pos">[3]</span> Many towns resisted at first, proudly keeping their local "sun time" alongside the new "railway time," and some public clocks displayed two sets of hands. <span class="l1-trap" title="Falso cognado: 'eventually' = 'finalmente', no 'eventualmente'">Eventually</span>, however, the convenience of a shared national time won the argument. <span class="pos">[4]</span> In 1880, the British government made Greenwich time the legal standard for the whole country, and other nations soon followed with standard times of their own.`,
+    insertion_sentence:"Safety, in other words, depended on everyone agreeing about what time it was.",
+    questions:[
+      {
+        id:"read_pass_b1_001_q1", question_type:"main_idea",
+        prompt:"What is the passage mainly about?",
+        options:[
+      {text:"Why trains in Britain were frequently late.", is_correct:false,
+           rationale:"Distractor. Los retrasos son un síntoma mencionado, no el tema."},
+      {text:"The invention of the mechanical clock.", is_correct:false,
+           rationale:"Distractor. No se describe la invención del reloj."},
+      {text:"How railways led to the adoption of standardized time.", is_correct:true,
+           rationale:"Correcto. Es el arco completo del texto."},
+      {text:"The history of the city of Greenwich.", is_correct:false,
+           rationale:"Distractor. Greenwich solo aporta la referencia horaria."}
+    ]
+      },
+      {
+        id:"read_pass_b1_001_q2", question_type:"vocabulary_in_context",
+        prompt:'In the final paragraph, the word "eventually" most closely means:',
+        options:[
+      {text:"in the end, after some time", is_correct:true,
+           rationale:"Correcto. 'Eventually' = finalmente, con el tiempo."},
+      {text:"occasionally, from time to time", is_correct:false,
+           rationale:"Distractor por confusión con 'eventual' en español."},
+      {text:"possibly, under certain conditions", is_correct:false,
+           rationale:"Falso cognado: 'eventualmente' (ES) sugiere posibilidad; 'eventually' (EN) no.", l1_trigger:"lexical"},
+      {text:"immediately, without delay", is_correct:false,
+           rationale:"Distractor opuesto al sentido real."}
+    ]
+      },
+      {
+        id:"read_pass_b1_001_q3", question_type:"insertion",
+        prompt:'Where would the following sentence best fit?<br><em>"Safety, in other words, depended on everyone agreeing about what time it was."</em>',
+        options:[
+          {text:"Position [1]", is_correct:false,
+           rationale:"No: aún no se ha presentado ningún riesgo."},
+          {text:"Position [2]", is_correct:true,
+           rationale:"Correcto. Resume el peligro descrito justo antes (dos trenes en la misma vía)."},
+          {text:"Position [3]", is_correct:false,
+           rationale:"No: el texto ya pasó a la solución, no al problema."},
+          {text:"Position [4]", is_correct:false,
+           rationale:"No: el párrafo final trata la adopción legal, no la seguridad."}
+        ]
+      },
+      {
+        id:"read_pass_b1_001_q4", question_type:"detail",
+        prompt:"According to the passage, how did some towns respond to railway time at first?",
+        options:[
+      {text:"They banned trains from stopping at their stations.", is_correct:false,
+           rationale:"Distractor. No se menciona ninguna prohibición."},
+      {text:"They built their own competing railways.", is_correct:false,
+           rationale:"Distractor sin base en el texto."},
+      {text:"They immediately adopted Greenwich time.", is_correct:false,
+           rationale:"Distractor. El texto dice que 'many towns resisted at first'."},
+      {text:"They kept their local sun time alongside the new railway time.", is_correct:true,
+           rationale:"Correcto. Algunos relojes públicos mostraban dos juegos de manecillas."}
+    ]
+      },
+      {
+        id:"read_pass_b1_001_q5", question_type:"inference",
+        prompt:"What can be inferred about travel before the railway era?",
+        options:[
+          {text:"It was fast but dangerous.", is_correct:false,
+           rationale:"Distractor. Era lo contrario: lento."},
+          {text:"It required passengers to carry two watches.", is_correct:false,
+           rationale:"Distractor. Los dos horarios aparecen después, con los trenes."},
+          {text:"It was impossible between distant cities.", is_correct:false,
+           rationale:"Distractor. Era posible, solo lento."},
+          {text:"It was slow enough that exact schedules did not matter.", is_correct:true,
+           rationale:"Correcto. El texto lo dice: los horarios no necesitaban ser precisos."}
+        ]
+      },
+      {
+        id:"read_pass_b1_001_q6", question_type:"rhetorical_purpose",
+        prompt:"Why does the author mention clocks with two sets of hands?",
+        options:[
+      {text:"To show that Greenwich had the most accurate clocks.", is_correct:false,
+           rationale:"Distractor. La precisión de Greenwich no se discute."},
+      {text:"To explain how mechanical clocks were repaired.", is_correct:false,
+           rationale:"Distractor. No se habla de reparaciones."},
+      {text:"To prove that railway time was confusing for passengers.", is_correct:false,
+           rationale:"Distractor. La confusión previa era por los tiempos locales."},
+      {text:"To illustrate how some towns resisted the new standard time.", is_correct:true,
+           rationale:"Correcto. Es la imagen concreta de la resistencia local."}
+    ]
       }
     ]
   }
@@ -1086,14 +1631,241 @@ const GRAMMAR_BANK = [
     pattern_id:"sva_distant_phrase",
     prompt:"The collection of artifacts from the early Mesoamerican period _____ currently on display at the museum.",
     options:[
-      {text:"are", is_correct:false,
-       rationale:"Concordancia con 'artifacts' (plural cercano), pero el sujeto real es 'collection' (singular).", l1_trigger:"morphological"},
       {text:"is", is_correct:true,
        rationale:"Correcto. El sujeto es 'The collection' (singular), no 'artifacts'."},
+      {text:"are", is_correct:false,
+       rationale:"Concordancia con 'artifacts' (plural cercano), pero el sujeto real es 'collection' (singular).", l1_trigger:"morphological"},
       {text:"were", is_correct:false,
        rationale:"Tiempo verbal y número incorrectos."},
       {text:"being", is_correct:false,
        rationale:"No es forma verbal finita."}
+    ]
+  },
+
+  {
+    id:"gram_sc_013", section:"Grammar", question_type:"sentence_completion", pool:"exam",
+    cefr_level:"B1.1", difficulty:"medium", l1_domains:["syntactic"],
+    pattern_id:"for_to_infinitive",
+    prompt:"Elena moved to Toronto last year _____ engineering at the university.",
+    options:[
+      {text:"for study", is_correct:false,
+       rationale:"Calco de 'para estudiar'. La finalidad se expresa con 'to' + infinitivo.", l1_trigger:"syntactic"},
+      {text:"for to study", is_correct:false,
+       rationale:"'For to' nunca se combina en inglés estándar. Calco directo del español.", l1_trigger:"syntactic"},
+      {text:"to study", is_correct:true,
+       rationale:"Correcto. Infinitivo de propósito: 'to' + verbo base."},
+      {text:"that she studies", is_correct:false,
+       rationale:"Estructura de cláusula innecesaria y agramatical para expresar propósito."}
+    ]
+  },
+  {
+    id:"gram_sc_014", section:"Grammar", question_type:"sentence_completion", pool:"exam",
+    cefr_level:"A2.2", difficulty:"easy", l1_domains:["morphological"],
+    pattern_id:"adjective_pluralization",
+    prompt:"The professor recommended two _____ novels for our final essay.",
+    options:[
+      {text:"interestings", is_correct:false,
+       rationale:"Los adjetivos en inglés NO se pluralizan. Calco de 'interesantes'.", l1_trigger:"morphological"},
+      {text:"interestingly", is_correct:false,
+       rationale:"Es un adverbio; no puede modificar directamente al sustantivo."},
+      {text:"interested", is_correct:false,
+       rationale:"'-ed' describe cómo se siente alguien, no cómo es la novela."},
+      {text:"interesting", is_correct:true,
+       rationale:"Correcto. El adjetivo es invariable aunque el sustantivo sea plural."}
+    ]
+  },
+  {
+    id:"gram_ei_008", section:"Grammar", question_type:"error_identification", pool:"exam",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["morphological"],
+    pattern_id:"people_plural_agreement",
+    prompt:'Identify the part that must be corrected:<br><em>"(A) Many people (B) is convinced that (C) working remotely improves both productivity and well-being."</em>',
+    options:[
+      {text:"(A) Many people", is_correct:false,
+       rationale:"'Many' + 'people' es correcto: 'people' es plural."},
+      {text:"(B) is convinced that", is_correct:true,
+       rationale:"Correcto. 'People' es plural en inglés: 'are convinced'. Calco de 'la gente es'."},
+      {text:"(C) working remotely improves", is_correct:false,
+       rationale:"Gerundio como sujeto con verbo en singular: correcto."},
+      {text:"No error", is_correct:false,
+       rationale:"Sí hay error en (B)."}
+    ]
+  },
+  {
+    id:"gram_sc_015", section:"Grammar", question_type:"sentence_completion", pool:"exam",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["lexical"],
+    pattern_id:"false_cognate_assist_attend",
+    prompt:"I couldn't _____ the conference last week because my flight was canceled.",
+    options:[
+      {text:"assist to", is_correct:false,
+       rationale:"Falso cognado: 'asistir a' NO es 'assist to'. 'Assist' significa ayudar.", l1_trigger:"lexical"},
+      {text:"assist", is_correct:false,
+       rationale:"'Assist' = ayudar. No significa estar presente en un evento.", l1_trigger:"lexical"},
+      {text:"attend to", is_correct:false,
+       rationale:"'Attend to' = ocuparse de algo. Para eventos, 'attend' es transitivo directo."},
+      {text:"attend", is_correct:true,
+       rationale:"Correcto. 'Attend' + evento, sin preposición."}
+    ]
+  },
+  {
+    id:"gram_ei_004", section:"Grammar", question_type:"error_identification", pool:"exam",
+    cefr_level:"C1.1", difficulty:"hard", l1_domains:["morphological"],
+    pattern_id:"unreal_conditional_past",
+    prompt:'Identify the part that must be corrected:<br><em>"If the researchers (A) would have controlled for age, the study (B) would have produced results (C) that were far more reliable."</em>',
+    options:[
+      {text:"(A) would have controlled", is_correct:true,
+       rationale:"Correcto. En la cláusula con 'if' del tercer condicional se usa 'had controlled', nunca 'would have'."},
+      {text:"(B) would have produced", is_correct:false,
+       rationale:"En la cláusula de resultado, 'would have' + participio es correcto."},
+      {text:"(C) that were far more reliable", is_correct:false,
+       rationale:"Cláusula relativa correcta."},
+      {text:"No error", is_correct:false,
+       rationale:"Sí hay error en (A)."}
+    ]
+  },
+  {
+    id:"gram_sc_016", section:"Grammar", question_type:"sentence_completion", pool:"exam",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["syntactic"],
+    pattern_id:"gerund_after_preposition",
+    prompt:"Sofia has always been interested in _____ ancient languages.",
+    options:[
+      {text:"to learn", is_correct:false,
+       rationale:"Después de preposición ('in') el verbo va en gerundio, no en infinitivo.", l1_trigger:"syntactic"},
+      {text:"learn", is_correct:false,
+       rationale:"Forma base imposible después de preposición."},
+      {text:"learning", is_correct:true,
+       rationale:"Correcto. Preposición + gerundio: 'interested in learning'."},
+      {text:"that she learns", is_correct:false,
+       rationale:"Cláusula agramatical después de 'interested in'."}
+    ]
+  },
+
+  /* ---- pool practice (Modo C) ---- */
+  {
+    id:"gram_sc_008", section:"Grammar", question_type:"sentence_completion", pool:"practice",
+    cefr_level:"A2.2", difficulty:"easy", l1_domains:["lexical"],
+    pattern_id:"say_tell_distinction",
+    prompt:"My advisor _____ me that the scholarship deadline had been extended.",
+    options:[
+      {text:"said", is_correct:false,
+       rationale:"'Say' no lleva objeto indirecto directo: sería 'said to me'.", l1_trigger:"lexical"},
+      {text:"talked", is_correct:false,
+       rationale:"'Talk' no introduce el contenido de un mensaje con 'that'."},
+      {text:"said to", is_correct:false,
+       rationale:"Gramaticalmente posible pero el hueco requiere una sola palabra natural: 'told'."},
+      {text:"told", is_correct:true,
+       rationale:"Correcto. 'Tell' + persona: 'told me that...'."}
+    ]
+  },
+  {
+    id:"gram_sc_009", section:"Grammar", question_type:"sentence_completion", pool:"practice",
+    cefr_level:"B1.1", difficulty:"medium", l1_domains:["lexical"],
+    pattern_id:"make_do_collocation",
+    prompt:"The committee needs to _____ a final decision before Friday's meeting.",
+    options:[
+      {text:"make", is_correct:true,
+       rationale:"Correcto. Colocación fija: 'make a decision'."},
+      {text:"take", is_correct:false,
+       rationale:"Calco de 'tomar una decisión'. En inglés estándar americano es 'make a decision'.", l1_trigger:"lexical"},
+      {text:"do", is_correct:false,
+       rationale:"Colocación incorrecta. En inglés las decisiones se 'hacen' con 'make'.", l1_trigger:"lexical"},
+      {text:"realize", is_correct:false,
+       rationale:"Falso cognado: 'realize' = darse cuenta, no realizar.", l1_trigger:"lexical"}
+    ]
+  },
+  {
+    id:"gram_sc_010", section:"Grammar", question_type:"sentence_completion", pool:"practice",
+    cefr_level:"B1.1", difficulty:"easy", l1_domains:["syntactic"],
+    pattern_id:"married_to_preposition",
+    prompt:"Our biology teacher is married _____ a civil engineer from Guadalajara.",
+    options:[
+      {text:"with", is_correct:false,
+       rationale:"Calco de 'casado con'. En inglés la preposición es 'to'.", l1_trigger:"syntactic"},
+      {text:"by", is_correct:false,
+       rationale:"'Married by' indicaría quién ofició la boda, no el cónyuge."},
+      {text:"of", is_correct:false,
+       rationale:"'Of' no se usa con 'married'."},
+      {text:"to", is_correct:true,
+       rationale:"Correcto. 'Married to' + persona."}
+    ]
+  },
+  {
+    id:"gram_ei_005", section:"Grammar", question_type:"error_identification", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["syntactic"],
+    pattern_id:"depend_on_preposition",
+    prompt:'Identify the part that must be corrected:<br><em>"Whether the field trip (A) takes place next month (B) depends of the weather and (C) the number of students who register."</em>',
+    options:[
+      {text:"(A) takes place next month", is_correct:false,
+       rationale:"Presente simple correcto en cláusula subordinada."},
+      {text:"(B) depends of the weather", is_correct:true,
+       rationale:"Correcto. Es 'depends on'. Calco de 'depende de'."},
+      {text:"(C) the number of students who register", is_correct:false,
+       rationale:"Estructura correcta con relativo 'who'."},
+      {text:"No error", is_correct:false,
+       rationale:"Sí hay error en (B)."}
+    ]
+  },
+  {
+    id:"gram_sc_011", section:"Grammar", question_type:"sentence_completion", pool:"practice",
+    cefr_level:"A2.1", difficulty:"easy", l1_domains:["morphological"],
+    pattern_id:"third_person_s",
+    prompt:"My roommate _____ at the campus library every Tuesday evening.",
+    options:[
+      {text:"study", is_correct:false,
+       rationale:"Falta la '-s' de tercera persona singular en presente simple.", l1_trigger:"morphological"},
+      {text:"studying", is_correct:false,
+       rationale:"Gerundio sin auxiliar: agramatical como verbo principal."},
+      {text:"is study", is_correct:false,
+       rationale:"Mezcla de auxiliar con forma base: agramatical."},
+      {text:"studies", is_correct:true,
+       rationale:"Correcto. Tercera persona singular: 'studies' (y cambia 'y' → 'ies')."}
+    ]
+  },
+  {
+    id:"gram_ei_006", section:"Grammar", question_type:"error_identification", pool:"practice",
+    cefr_level:"B1.1", difficulty:"medium", l1_domains:["syntactic"],
+    pattern_id:"double_negative",
+    prompt:'Identify the part that must be corrected:<br><em>"The new exchange student (A) told us that she (B) didn\'t know nobody (C) in the entire city yet."</em>',
+    options:[
+      {text:"(A) told us that", is_correct:false,
+       rationale:"'Tell' + objeto indirecto: correcto."},
+      {text:"(B) didn't know nobody", is_correct:true,
+       rationale:"Correcto. Doble negación (calco de 'no conocía a nadie'). Debe ser 'didn't know anybody'."},
+      {text:"(C) in the entire city", is_correct:false,
+       rationale:"Frase preposicional correcta."},
+      {text:"No error", is_correct:false,
+       rationale:"Sí hay error en (B)."}
+    ]
+  },
+  {
+    id:"gram_sc_012", section:"Grammar", question_type:"sentence_completion", pool:"practice",
+    cefr_level:"B1.1", difficulty:"easy", l1_domains:["syntactic"],
+    pattern_id:"relative_pronoun_who_which",
+    prompt:"The scientist _____ discovered the vaccine received an international award.",
+    options:[
+      {text:"which", is_correct:false,
+       rationale:"'Which' se usa para cosas; para personas se usa 'who'.", l1_trigger:"syntactic"},
+      {text:"what", is_correct:false,
+       rationale:"'What' no funciona como relativo con antecedente expreso."},
+      {text:"whom", is_correct:false,
+       rationale:"'Whom' es para objeto, no sujeto de la cláusula relativa."},
+      {text:"who", is_correct:true,
+       rationale:"Correcto. Relativo de persona en función de sujeto."}
+    ]
+  },
+  {
+    id:"gram_ei_007", section:"Grammar", question_type:"error_identification", pool:"practice",
+    cefr_level:"B2.2", difficulty:"hard", l1_domains:["syntactic"],
+    pattern_id:"article_generalization",
+    prompt:'Identify the part that must be corrected:<br><em>"(A) The happiness, according to several longitudinal studies, (B) depends more on strong social connections (C) than on income level."</em>',
+    options:[
+      {text:"(A) The happiness", is_correct:true,
+       rationale:"Correcto. Los sustantivos abstractos en sentido general van SIN artículo: 'Happiness'. Calco de 'la felicidad'."},
+      {text:"(B) depends more on", is_correct:false,
+       rationale:"Preposición y comparativo correctos."},
+      {text:"(C) than on income level", is_correct:false,
+       rationale:"Paralelismo comparativo correcto."},
+      {text:"No error", is_correct:false,
+       rationale:"Sí hay error en (A)."}
     ]
   }
 ];
@@ -1105,14 +1877,14 @@ const SPELLING_BANK = [
     pattern_id:"double_consonant_simplification",
     prompt:'Choose the correct spelling:<br><em>"The research showed that the two parallel trials had _____ results."</em>',
     options:[
-      {text:"different", is_correct:true,
-       rationale:"Correcto. Doble 'f' y sufijo '-ent'."},
+      {text:"differant", is_correct:false,
+       rationale:"Sufijo incorrecto."},
       {text:"diferent", is_correct:false,
        rationale:"Simplifica la doble 'f'. Calco del español 'diferente'.", l1_trigger:"orthographic"},
       {text:"diferrent", is_correct:false,
        rationale:"Duplicación incorrecta de 'r' por sobre-generalización.", l1_trigger:"orthographic"},
-      {text:"differant", is_correct:false,
-       rationale:"Sufijo incorrecto."}
+      {text:"different", is_correct:true,
+       rationale:"Correcto. Doble 'f' y sufijo '-ent'."}
     ]
   },
   {
@@ -1121,14 +1893,14 @@ const SPELLING_BANK = [
     pattern_id:"e_epenthesis_orthographic",
     prompt:'Choose the correct spelling:<br><em>"Maria is a graduate _____ at Stanford University."</em>',
     options:[
-      {text:"student", is_correct:true,
-       rationale:"Correcto. El inglés no usa 'e-' inicial en clústeres /s/+consonante."},
+      {text:"stoodent", is_correct:false,
+       rationale:"Vocal incorrecta."},
       {text:"estudent", is_correct:false,
        rationale:"Epéntesis 'e-' inicial. El español agrega 'e' ante /s/+consonante.", l1_trigger:"orthographic"},
       {text:"studant", is_correct:false,
        rationale:"Vocal incorrecta."},
-      {text:"stoodent", is_correct:false,
-       rationale:"Vocal incorrecta."}
+      {text:"student", is_correct:true,
+       rationale:"Correcto. El inglés no usa 'e-' inicial en clústeres /s/+consonante."}
     ]
   },
   {
@@ -1137,14 +1909,14 @@ const SPELLING_BANK = [
     pattern_id:"double_consonant_overgeneralization",
     prompt:'Choose the correct spelling:<br><em>"Effective _____ skills are essential for any professional career."</em>',
     options:[
-      {text:"comunication", is_correct:false,
-       rationale:"Falta una 'm'. Calco del español 'comunicación'.", l1_trigger:"orthographic"},
       {text:"communication", is_correct:true,
        rationale:"Correcto. Doble 'm' y sufijo '-tion'."},
+      {text:"communicación", is_correct:false,
+       rationale:"Sufijo del español. Inglés usa '-tion'."},
       {text:"comunnication", is_correct:false,
        rationale:"Duplicación incorrecta de 'n' por sobre-generalización.", l1_trigger:"orthographic"},
-      {text:"communicación", is_correct:false,
-       rationale:"Sufijo del español. Inglés usa '-tion'."}
+      {text:"comunication", is_correct:false,
+       rationale:"Falta una 'm'. Calco del español 'comunicación'.", l1_trigger:"orthographic"}
     ]
   },
   {
@@ -1169,14 +1941,129 @@ const SPELLING_BANK = [
     pattern_id:"homophone_their_there",
     prompt:'Choose the correct word:<br><em>"The students said _____ project would be ready by Friday."</em>',
     options:[
-      {text:"there", is_correct:false,
-       rationale:"'There' indica lugar o existencia, no posesión.", l1_trigger:"orthographic"},
       {text:"their", is_correct:true,
        rationale:"Correcto. 'Their' es el posesivo plural de 'they'."},
+      {text:"theirs", is_correct:false,
+       rationale:"'Theirs' es pronombre, no determinante. Requiere no llevar sustantivo después."},
       {text:"they're", is_correct:false,
        rationale:"'They're' es contracción de 'they are'.", l1_trigger:"orthographic"},
-      {text:"theirs", is_correct:false,
-       rationale:"'Theirs' es pronombre, no determinante. Requiere no llevar sustantivo después."}
+      {text:"there", is_correct:false,
+       rationale:"'There' indica lugar o existencia, no posesión.", l1_trigger:"orthographic"}
+    ]
+  },
+
+  {
+    id:"spell_mc_005", section:"Spelling", question_type:"multiple_choice", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"double_consonant_simplification",
+    prompt:'Choose the correct spelling:<br><em>"A valid passport is _____ for all international students."</em>',
+    options:[
+      {text:"necessary", is_correct:true,
+       rationale:"Correcto. Una 'c', doble 's': ne-ce-ssa-ry."},
+      {text:"necessery", is_correct:false,
+       rationale:"Vocal incorrecta en el sufijo: es '-ary'."},
+      {text:"necesary", is_correct:false,
+       rationale:"Simplifica la doble 's'. Calco del español 'necesario'.", l1_trigger:"orthographic"},
+      {text:"neccessary", is_correct:false,
+       rationale:"Duplicación incorrecta de 'c'. La doble letra es la 's'.", l1_trigger:"orthographic"}
+    ]
+  },
+  {
+    id:"spell_ti_003", section:"Spelling", question_type:"text_input", pool:"practice",
+    cefr_level:"B1.1", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"double_consonant_gerund",
+    prompt:'Write the correct spelling of the misspelled word:<br><em>"At the <strong>begining</strong> of the semester, every student receives a printed syllabus."</em>',
+    expected:"beginning",
+    rationale:"Es 'beginning': la 'n' se duplica al agregar '-ing' porque la sílaba final 'gin' es acentuada y termina en consonante."
+  },
+  {
+    id:"spell_mc_006", section:"Spelling", question_type:"multiple_choice", pool:"exam",
+    cefr_level:"B1.1", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"homophone_its_its",
+    prompt:'Choose the correct word:<br><em>"The university updated _____ enrollment policy last semester."</em>',
+    options:[
+      {text:"it's", is_correct:false,
+       rationale:"'It's' es contracción de 'it is'. Aquí se necesita el posesivo.", l1_trigger:"orthographic"},
+      {text:"its'", is_correct:false,
+       rationale:"Forma inexistente en inglés."},
+      {text:"its", is_correct:true,
+       rationale:"Correcto. 'Its' (sin apóstrofo) es el posesivo de 'it'."},
+      {text:"is", is_correct:false,
+       rationale:"Verbo, no posesivo. No encaja sintácticamente."}
+    ]
+  },
+  {
+    id:"spell_ti_004", section:"Spelling", question_type:"text_input", pool:"exam",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"ie_ei_rule",
+    prompt:'Write the correct spelling of the misspelled word:<br><em>"You will <strong>recieve</strong> your exam results by email within five business days."</em>',
+    expected:"receive",
+    rationale:"Es 'receive': la regla 'i before e, except after c' — después de 'c' el orden es 'ei'."
+  },
+
+  /* ---- pool practice (Modo C) ---- */
+  {
+    id:"spell_mc_007", section:"Spelling", question_type:"multiple_choice", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"silent_letter_omission",
+    prompt:'Choose the correct spelling:<br><em>"Protecting the _____ is a central topic in modern engineering programs."</em>',
+    options:[
+      {text:"envairoment", is_correct:false,
+       rationale:"Transcripción fonética incorrecta.", l1_trigger:"orthographic"},
+      {text:"environment", is_correct:true,
+       rationale:"Correcto. Lleva 'n' antes de la 'm': en-vi-ron-ment."},
+      {text:"enviornment", is_correct:false,
+       rationale:"Orden de letras incorrecto."},
+      {text:"enviroment", is_correct:false,
+       rationale:"Omite la 'n' que casi no se pronuncia. Error muy común.", l1_trigger:"orthographic"}
+    ]
+  },
+  {
+    id:"spell_ti_005", section:"Spelling", question_type:"text_input", pool:"exam",
+    cefr_level:"B2.1", difficulty:"hard", l1_domains:["orthographic"],
+    pattern_id:"vowel_transfer_cognate",
+    prompt:'Write the correct spelling of the misspelled word:<br><em>"Taking attendance is the <strong>responsability</strong> of each group leader."</em>',
+    expected:"responsibility",
+    rationale:"Es 'responsibility' con 'i': el español 'responsabilidad' transfiere la 'a', pero el inglés usa 'responsible → responsibility'."
+  },
+  {
+    id:"spell_mc_008", section:"Spelling", question_type:"multiple_choice", pool:"practice",
+    cefr_level:"B1.2", difficulty:"medium", l1_domains:["orthographic"],
+    pattern_id:"cognate_vowel_transfer",
+    prompt:'Choose the correct spelling:<br><em>"The new dormitories are surprisingly _____ for their price."</em>',
+    options:[
+      {text:"confortable", is_correct:false,
+       rationale:"Calco directo del español 'confortable'. En inglés es con 'm'.", l1_trigger:"orthographic"},
+      {text:"comfortable", is_correct:true,
+       rationale:"Correcto. 'Comfort' + '-able', con 'm'."},
+      {text:"comfortible", is_correct:false,
+       rationale:"Sufijo incorrecto: es '-able', no '-ible'."},
+      {text:"camfortable", is_correct:false,
+       rationale:"Vocal inicial incorrecta."}
+    ]
+  },
+  {
+    id:"spell_ti_006", section:"Spelling", question_type:"text_input", pool:"practice",
+    cefr_level:"A2.2", difficulty:"easy", l1_domains:["orthographic"],
+    pattern_id:"silent_h_omission",
+    prompt:'Write the correct spelling of the misspelled word:<br><em>"Please indicate <strong>wich</strong> course sections you plan to take next term."</em>',
+    expected:"which",
+    rationale:"Es 'which' con 'h' después de la 'w'. La 'h' no se pronuncia claramente, por eso se omite al escribir."
+  },
+  {
+    id:"spell_mc_009", section:"Spelling", question_type:"multiple_choice", pool:"exam",
+    cefr_level:"B2.1", difficulty:"hard", l1_domains:["orthographic"],
+    pattern_id:"double_consonant_business",
+    prompt:'Choose the correct spelling:<br><em>"After graduation, Marcos wants to start his own _____ in Monterrey."</em>',
+    options:[
+      {text:"bussiness", is_correct:false,
+       rationale:"Duplicación incorrecta de la 's' central.", l1_trigger:"orthographic"},
+      {text:"busines", is_correct:false,
+       rationale:"Termina en '-nes'. La forma correcta termina en '-ness' (doble 's')."},
+      {text:"business", is_correct:true,
+       rationale:"Correcto. 'Busy' → 'business': una 's' tras 'bu', doble 's' en '-ness'."},
+      {text:"bussines", is_correct:false,
+       rationale:"Duplica la letra equivocada y omite la correcta.", l1_trigger:"orthographic"}
     ]
   }
 ];
@@ -1196,6 +2083,41 @@ const WRITING_BANK = [
     constraints:{
       min_words:100, max_words:150,
       register:"academic / semi-formal",
+      time_minutes:15
+    }
+  },
+
+  {
+    id:"writing_email_002", section:"Writing", pool:"exam",
+    cefr_target:"B2.1", task_type:"write_an_email",
+    title:"Dormitory Maintenance Request",
+    situation:"You live in a university dormitory. For the past week, the heating in your room has not been working properly, and the temperature drops sharply at night.",
+    task:"Write an email to the housing office manager, Mr. Daniel Reyes, reporting the problem and requesting a repair.",
+    required_points:[
+      "Describe the problem and explain how long it has been happening.",
+      "Propose two specific time windows when a technician could visit your room.",
+      "Ask what temporary options are available if the repair takes several days."
+    ],
+    constraints:{
+      min_words:100, max_words:150,
+      register:"formal / administrative",
+      time_minutes:15
+    }
+  },
+  {
+    id:"writing_opinion_001", section:"Writing", pool:"practice",
+    cefr_target:"B2.1", task_type:"opinion_paragraph",
+    title:"Recorded Lectures Debate",
+    situation:"Your academic writing class is debating the following statement: 'Universities should record all lectures and make the videos available to students.'",
+    task:"Write a paragraph giving your opinion on this statement.",
+    required_points:[
+      "State your position clearly in the first sentence.",
+      "Support your position with at least two distinct reasons or examples.",
+      "Acknowledge one possible argument from the opposite side and respond to it."
+    ],
+    constraints:{
+      min_words:100, max_words:160,
+      register:"academic",
       time_minutes:15
     }
   }
@@ -1505,10 +2427,39 @@ async function saveSessionToCloud(session){
   }
 }
 
+/* v4 · Autoguardado ligero en localStorage (funciona SIN iniciar sesión).
+ * En lugar de serializar los ítems completos (lo que colgaba algunos
+ * navegadores en v2), guardamos solo referencias: {sección, id, questionIdx}.
+ * Al reanudar, los ítems se reconstruyen desde los bancos. */
+const DRAFT_VERSION = 4;
+
 async function saveExamDraft(){
-  // Temporarily disabled: serializing the full item bank on every question can
-  // overwhelm some browsers. Final results still save locally and to Supabase.
-  return;
+  if(!state?.items?.length) return;
+  try{
+    const remainingMs = state.startTime
+      ? Math.max(0, state.durationMs - (Date.now() - state.startTime))
+      : null;
+    const draft = {
+      v: DRAFT_VERSION,
+      savedAt: Date.now(),
+      mode: state.mode,
+      selectedSkill: state.selectedSkill,
+      sections: state.sections,
+      currentQuestionIdx: state.currentQuestionIdx,
+      itemRefs: state.items.map(s => ({sec:s.sectionName, id:s.item.id, q:s.questionIdx})),
+      responses: state.responses,
+      started: !!state.startTime,
+      remainingMs
+    };
+    await storageAdapter.set("toefl_exam_draft", JSON.stringify(draft));
+  }catch(e){console.warn("Draft save failed:", e)}
+}
+
+let draftSaveTimer = null;
+function scheduleDraftSave(){
+  if(!state?.items?.length) return;
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(()=>{ saveExamDraft(); }, 400);
 }
 
 async function clearExamDraft(){
@@ -1519,8 +2470,25 @@ async function clearExamDraft(){
 async function loadExamDraft(){
   try{
     const result = await storageAdapter.get("toefl_exam_draft");
-    return result ? JSON.parse(result.value) : null;
+    if(!result) return null;
+    const draft = JSON.parse(result.value);
+    if(draft?.v !== DRAFT_VERSION || !Array.isArray(draft.itemRefs) || !draft.itemRefs.length) return null;
+    return draft;
   }catch(e){return null}
+}
+
+/* Reconstruye state.items desde los bancos a partir de las referencias del draft.
+ * Devuelve null si algún ítem ya no existe (p. ej. tras actualizar el banco). */
+function rebuildItemsFromRefs(itemRefs){
+  const items = [];
+  for(const ref of itemRefs){
+    const bank = bankForSection(ref.sec);
+    const item = bank.find(i => i.id === ref.id);
+    if(!item) return null;
+    if(ref.q !== null && ref.q !== undefined && !(item.questions && item.questions[ref.q])) return null;
+    items.push({sectionName:ref.sec, item, questionIdx:(ref.q===undefined?null:ref.q)});
+  }
+  return items;
 }
 
 async function renderHistory(){
@@ -1534,7 +2502,7 @@ async function renderHistory(){
   const sourceLabel = cloudHistory.length ? "Nube" : "Dispositivo";
   const draftHtml = draft ? `
     <div class="sec-card" style="margin-bottom:10px;border-color:var(--accent);background:rgba(14,118,103,.06)">
-      <div class="row"><span>Sesión en progreso · Modo ${draft.state.mode}</span><span class="v">${draft.state.currentQuestionIdx+1} / ${draft.state.items.length}</span></div>
+      <div class="row"><span>Sesión en progreso · Modo ${draft.mode}${draft.selectedSkill ? " · "+draft.selectedSkill : ""}</span><span class="v">${draft.currentQuestionIdx+1} / ${draft.itemRefs.length}</span></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
         <button class="btn" onclick="resumeDraft()">Continuar</button>
         <button class="btn secondary" onclick="discardDraft()">Descartar</button>
@@ -1552,16 +2520,31 @@ async function renderHistory(){
 
 async function resumeDraft(){
   const draft = await loadExamDraft();
-  if(!draft?.state) return;
-  state = draft.state;
-  state.timerInterval = null;
-  if(state.startTime){
-    state.durationMs = Math.max(1000, draft.remainingMs || state.durationMs);
+  if(!draft) return;
+  const items = rebuildItemsFromRefs(draft.itemRefs);
+  if(!items){
+    // El banco cambió desde que se guardó el borrador; no se puede reanudar.
+    await clearExamDraft();
+    toast("La sesión guardada ya no es compatible con esta versión. Empieza una nueva.", "warning");
+    renderHistory();
+    return;
+  }
+  state = {
+    mode: draft.mode, selectedSkill: draft.selectedSkill,
+    startTime: null, durationMs: null, timerInterval: null,
+    sections: draft.sections, currentSectionIdx: 0,
+    currentQuestionIdx: Math.min(draft.currentQuestionIdx || 0, items.length - 1),
+    items, responses: draft.responses || {},
+    writingEvaluation: null, l1Profile: null, practiceState: null
+  };
+  if(draft.started){
+    state.durationMs = Math.max(60*1000, draft.remainingMs ?? MODE_CONFIG[state.mode].durationMin*60*1000);
     state.startTime = Date.now();
     startTimer();
     document.getElementById("modeBadge").textContent = `Modo ${state.mode}`;
     showScreen("exam");
     renderCurrentQuestion();
+    toast("Sesión restaurada. Continúas donde te quedaste.", "success");
   }else{
     showInstructions();
   }
@@ -1618,9 +2601,9 @@ function buildItemSequence(mode, sections){
   const seq = [];
 
   for(const sec of sections){
-    const targetCount = mode==='C' ? counts[sec] : counts[sec];
+    const targetCount = counts[sec];
     const bank = bankForSection(sec);
-    const selected = selectItems(bank, targetCount);
+    const selected = selectItems(bank, targetCount, mode);
 
     for(const item of selected){
       if(item.questions && item.questions.length){
@@ -1647,10 +2630,17 @@ function bankForSection(sec){
   return [];
 }
 
-function selectItems(bank, n){
-  // Random selection without repetition; if n > bank size, return all available
-  const shuffled = [...bank].sort(()=>Math.random()-0.5);
-  return shuffled.slice(0, Math.min(n, bank.length));
+function selectItems(bank, n, mode){
+  /* v4: selección aleatoria consciente de pools.
+   * - Modos A/B (examen): ítems con pool "exam" (o sin pool, los originales).
+   * - Modo C (por habilidad): ítems con pool "practice", para que practicar
+   *   una habilidad no "queme" las preguntas del diagnóstico completo.
+   * Si el pool preferido no alcanza, se completa con el otro. */
+  const shuffle = a => [...a].sort(()=>Math.random()-0.5);
+  const wantsPractice = mode === 'C';
+  const primary  = shuffle(bank.filter(it => wantsPractice ? it.pool === "practice" : it.pool !== "practice"));
+  const fallback = shuffle(bank.filter(it => wantsPractice ? it.pool !== "practice" : it.pool === "practice"));
+  return primary.concat(fallback).slice(0, Math.min(n, bank.length));
 }
 
 function showInstructions(){
@@ -1664,8 +2654,8 @@ function showInstructions(){
   document.getElementById("instrLead").innerHTML = mode==='A'
     ? `Diagnóstico <span class="ital">completo</span> en cinco secciones. Tómate tu tiempo. Si necesitas pausar, cierra el navegador y vuelve más tarde — tu sesión se guarda automáticamente.`
     : mode==='B'
-    ? `Diagnóstico <span class="ital">rápido</span>. Cobertura completa de las cinco secciones, con menos ítems por habilidad.`
-    : `Sección única de práctica <span class="ital">enfocada</span>. Sin banda global, solo banda de la habilidad.`;
+    ? `Diagnóstico <span class="ital">rápido</span>. Cobertura completa de las cinco secciones, con menos ítems por habilidad. Tu avance se guarda automáticamente en este dispositivo.`
+    : `Sección única de práctica <span class="ital">enfocada</span>, con ítems distintos a los del diagnóstico completo. Sin banda global, solo banda de la habilidad. Tu avance se guarda automáticamente.`;
 
   const totalItems = state.items.length;
   document.getElementById("instrCard").innerHTML = `
@@ -1681,7 +2671,7 @@ function showInstructions(){
         <strong>Cronómetro:</strong> Visible en la parte superior. Cuando llegue a cero, el examen termina automáticamente y se evalúa lo respondido.
       </li>
       <li style="padding:10px 0;border-bottom:1px dashed var(--line);font-family:var(--serif)">
-        <strong>Listening:</strong> Cada audio se reproduce con el sintetizador del navegador. Tienes hasta 2 reproducciones por audio.
+        <strong>Listening:</strong> Cada audio se reproduce con voz inglesa real. Tienes hasta 2 reproducciones por audio.
       </li>
       <li style="padding:10px 0;font-family:var(--serif)">
         <strong>Writing:</strong> Tu respuesta se evalúa con una rúbrica analítica. Si no hay backend configurado, la app usa una evaluación local formativa con feedback inmediato.
@@ -1949,12 +2939,14 @@ function selectOption(key, idx){
     if(i === idx) el.classList.add('selected');
     else el.classList.remove('selected');
   });
+  scheduleDraftSave();
 }
 
 function updateTextAnswer(key, value){
   state.responses[key] = state.responses[key] || {};
   state.responses[key].textAnswer = value;
   state.responses[key].timestamp = Date.now();
+  scheduleDraftSave();
 }
 
 /* ===== Listening: Google Translate TTS (MP3 real con voz inglesa) =====
@@ -2194,6 +3186,7 @@ function prevQuestion(){
   if(current <= 0) return;
   state.currentQuestionIdx = current - 1;
   renderCurrentQuestion();
+  scheduleDraftSave();
 }
 
 function wireNavigationControls(){
@@ -2223,20 +3216,28 @@ function scoreSection(sectionName){
   }
 
   let correct = 0, total = 0;
+  let wCorrect = 0, wTotal = 0;           // v4: puntaje ponderado por dificultad
+  let hardCorrect = 0, hardTotal = 0;     // v4: evidencia en ítems difíciles
+  let mhCorrect = 0, mhTotal = 0;         // v4: evidencia medium+hard
   const l1ErrorsBySection = {};
 
   for(const seq of sectionItems){
     const key = getItemKey(seq);
     const resp = state.responses[key];
     total += 1;
+    const diff = seq.item.difficulty || "medium";
+    const w = DIFF_WEIGHT[diff] || 1.0;
+    wTotal += w;
+    if(diff === "hard"){ hardTotal += 1; }
+    if(diff === "hard" || diff === "medium"){ mhTotal += 1; }
 
+    let isCorrect = false;
     if(seq.item.question_type === "text_input"){
       // Spelling text input
       const expected = seq.item.expected.toLowerCase().trim();
       const given = (resp?.textAnswer||"").toLowerCase().trim();
-      const isCorrect = given === expected;
-      if(isCorrect) correct += 1;
-      else if(seq.item.l1_domains){
+      isCorrect = given === expected;
+      if(!isCorrect && seq.item.l1_domains){
         for(const d of seq.item.l1_domains){
           l1ErrorsBySection[d] = (l1ErrorsBySection[d]||0)+1;
         }
@@ -2247,10 +3248,8 @@ function scoreSection(sectionName){
       const selectedIdx = resp?.selectedOptionIdx;
 
       if(selectedIdx !== undefined && question.options[selectedIdx]){
-        const isCorrect = question.options[selectedIdx].is_correct;
-        if(isCorrect){
-          correct += 1;
-        } else {
+        isCorrect = !!question.options[selectedIdx].is_correct;
+        if(!isCorrect){
           // Record L1 trigger of selected distractor
           const trigger = question.options[selectedIdx].l1_trigger;
           if(trigger){
@@ -2259,10 +3258,34 @@ function scoreSection(sectionName){
         }
       }
     }
+
+    if(isCorrect){
+      correct += 1;
+      wCorrect += w;
+      if(diff === "hard"){ hardCorrect += 1; }
+      if(diff === "hard" || diff === "medium"){ mhCorrect += 1; }
+    }
   }
 
-  const rawScore = total > 0 ? (correct/total)*100 : 0;
-  const banding = rawToBand(rawScore);
+  const rawScore = wTotal > 0 ? (wCorrect/wTotal)*100 : 0;
+  let banding = rawToBand(rawScore);
+
+  /* v4 · Techos de evidencia: una banda alta exige desempeño real en ítems
+   * exigentes, no solo acumular aciertos fáciles.
+   * - C1+ (≥5.0) requiere ≥60% en ítems hard (y que existan ítems hard).
+   * - C2 (6.0) requiere ≥85% en ítems hard.
+   * - B2.2+ (≥4.5) requiere ≥55% en ítems medium+hard. */
+  const hardAcc = hardTotal > 0 ? hardCorrect/hardTotal : 0;
+  const mhAcc = mhTotal > 0 ? mhCorrect/mhTotal : 0;
+  if(banding.band >= 6.0 && (hardTotal === 0 || hardAcc < 0.85)){
+    banding = capBandTo(banding, 5.5);
+  }
+  if(banding.band >= 5.0 && (hardTotal === 0 || hardAcc < 0.60)){
+    banding = capBandTo(banding, 4.5);
+  }
+  if(banding.band >= 4.5 && (mhTotal === 0 || mhAcc < 0.55)){
+    banding = capBandTo(banding, 4.0);
+  }
 
   return {
     section: sectionName,
@@ -2271,6 +3294,7 @@ function scoreSection(sectionName){
     cefr: banding.cefr,
     descriptor: banding.desc,
     correct, total,
+    hard_correct: hardCorrect, hard_total: hardTotal,
     l1_errors: l1ErrorsBySection
   };
 }
@@ -2392,6 +3416,51 @@ function buildL1Profile(sectionResults){
 
 /* ============================== 9. FINISH EXAM ============================== */
 
+/* v4 · Recolecta SOLO las preguntas falladas o sin responder (excepto Writing)
+ * para la pantalla de revisión post-examen. */
+function buildReviewItems(){
+  const review = [];
+  for(const seq of state.items){
+    if(seq.sectionName === "Writing") continue;
+    const key = getItemKey(seq);
+    const resp = state.responses[key];
+
+    if(seq.item.question_type === "text_input"){
+      const expected = seq.item.expected;
+      const given = (resp?.textAnswer || "").trim();
+      const isCorrect = given.toLowerCase() === expected.toLowerCase().trim();
+      if(!isCorrect){
+        review.push({
+          section: seq.sectionName, kind: "text",
+          title: seq.item.title || "",
+          prompt: seq.item.prompt,
+          given, expected,
+          rationale: seq.item.rationale || ""
+        });
+      }
+    } else {
+      const q = seq.questionIdx !== null ? seq.item.questions[seq.questionIdx] : seq.item;
+      const sel = resp?.selectedOptionIdx;
+      const correctIdx = q.options.findIndex(o => o.is_correct);
+      const isCorrect = sel !== undefined && !!q.options[sel]?.is_correct;
+      if(!isCorrect){
+        review.push({
+          section: seq.sectionName, kind: "mc",
+          title: seq.item.title || "",
+          prompt: q.prompt,
+          options: q.options.map(o => o.text),
+          selectedIdx: (sel === undefined ? null : sel),
+          correctIdx,
+          correctRationale: q.options[correctIdx]?.rationale || "",
+          selectedRationale: (sel !== undefined ? (q.options[sel]?.rationale || "") : ""),
+          script: seq.sectionName === "Listening" ? (seq.item.script || "") : ""
+        });
+      }
+    }
+  }
+  return review;
+}
+
 async function finishExam(timedOut){
   stopTimer();
   stopAudio();
@@ -2414,11 +3483,23 @@ async function finishExam(timedOut){
   const l1Profile = buildL1Profile(sectionResults);
   state.l1Profile = l1Profile;
 
-  // Build the global banding
-  const globalBanding = rawToBand(overall.weighted * (100/6));
+  /* v4 · Regla de evidencia global: una banda global C1+ (≥5.0) exige que al
+   * menos DOS habilidades hayan alcanzado C1 por sí mismas. Evita que un par
+   * de secciones cortas infladas arrastren el promedio hacia arriba. */
+  let cappedWeighted = overall.weighted;
+  const strongSections = sectionResults.filter(r => !r.pending && r.band >= 5.0).length;
+  if(cappedWeighted >= 5.0 && strongSections < 2){
+    cappedWeighted = 4.5;
+  }
+
+  // Build the global banding (v4: mapeo directo banda → fila CEFR, sin pasar por %)
+  const globalBanding = bandValueToCefr(cappedWeighted);
   const globalCefrBand = sectionResults.length === 1
     ? {band: sectionResults[0].band, cefr: sectionResults[0].cefr, descriptor: sectionResults[0].descriptor}
-    : {band: overall.weighted, cefr: globalBanding.cefr, descriptor: globalBanding.desc};
+    : {band: cappedWeighted, cefr: globalBanding.cefr, descriptor: globalBanding.desc};
+
+  // v4 · Datos para la pantalla "Revisar mis errores"
+  const reviewItems = buildReviewItems();
 
   const session = {
     id: "session_" + Date.now(),
@@ -2430,6 +3511,7 @@ async function finishExam(timedOut){
     cefr: globalCefrBand.cefr,
     descriptor: globalCefrBand.descriptor,
     l1Profile,
+    reviewItems,
     writingEvaluation: state.writingEvaluation,
     completedAt: new Date().toISOString(),
     timedOut
@@ -2456,7 +3538,7 @@ function emergencyFinishExam(timedOut, err){
     catch(e){return null}
   }).filter(Boolean);
   const overall = sectionResults.length ? computeOverallBand(sectionResults) : {average:1, weighted:1};
-  const banding = rawToBand(overall.weighted * (100/6));
+  const banding = bandValueToCefr(overall.weighted);
   const session = {
     id: "session_" + Date.now(),
     mode: state.mode || "B",
@@ -2744,6 +3826,20 @@ function renderResults(session){
       </div>
     `}
 
+    ${session.reviewItems && session.reviewItems.length ? `
+      <div class="callout" style="margin-top:24px">
+        <strong>Revisión de errores.</strong> Tuviste ${session.reviewItems.length} pregunta${session.reviewItems.length!==1?'s':''} incorrecta${session.reviewItems.length!==1?'s':''} o sin responder. Revísalas para entender qué era lo correcto y por qué.
+        <div style="margin-top:12px">
+          <button class="btn" onclick="toggleErrorReview()">🔍 Revisar mis errores (${session.reviewItems.length})</button>
+        </div>
+      </div>
+      <div id="errorReviewContainer" class="hidden" style="margin-top:16px"></div>
+    ` : (session.reviewItems ? `
+      <div class="callout" style="margin-top:24px">
+        <strong>Cero errores en las secciones objetivas.</strong> Todas tus respuestas de opción múltiple y escritura de palabras fueron correctas.
+      </div>
+    ` : '')}
+
     <div id="recsContainer"></div>
 
     <hr class="divider">
@@ -2777,6 +3873,84 @@ function renderSectionCard(r){
       <div class="band-bar"><div class="band-fill" style="width:${pct}%"></div></div>
     </div>
   `;
+}
+
+/* v4 · Pantalla de revisión de errores: solo preguntas falladas/omitidas */
+function toggleErrorReview(){
+  const el = document.getElementById("errorReviewContainer");
+  if(!el) return;
+  if(el.classList.contains("hidden")){
+    el.innerHTML = renderErrorReview(state.lastSession);
+    el.classList.remove("hidden");
+    el.scrollIntoView({behavior:"smooth", block:"start"});
+  }else{
+    el.classList.add("hidden");
+    el.innerHTML = "";
+  }
+}
+
+function renderErrorReview(session){
+  if(!session?.reviewItems?.length) return "";
+  const letters = ["A","B","C","D","E"];
+  let currentSection = "";
+  let out = "";
+
+  for(const r of session.reviewItems){
+    if(r.section !== currentSection){
+      currentSection = r.section;
+      out += `<h4 style="margin-top:20px">${currentSection}</h4>`;
+    }
+
+    if(r.kind === "text"){
+      out += `
+        <div class="sec-card" style="margin-bottom:12px">
+          ${r.title ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);margin-bottom:6px">${escapeHtml(r.title)}</div>` : ""}
+          <div style="font-family:var(--serif);margin-bottom:10px">${r.prompt}</div>
+          <div class="row"><span class="dim">Tu respuesta</span>
+            <span class="v" style="color:var(--danger,#b3423f)">${r.given ? escapeHtml(r.given) : "(sin respuesta)"}</span></div>
+          <div class="row"><span class="dim">Respuesta correcta</span>
+            <span class="v" style="color:var(--accent)">${escapeHtml(r.expected)}</span></div>
+          ${r.rationale ? `<div style="font-size:13px;color:var(--ink-dim);margin-top:8px;border-top:1px dashed var(--line);padding-top:8px">💡 ${escapeHtml(r.rationale)}</div>` : ""}
+        </div>`;
+    } else {
+      const sel = r.selectedIdx;
+      const selText = sel !== null && r.options[sel] !== undefined
+        ? `${letters[sel]}) ${escapeHtml(r.options[sel])}` : "(sin respuesta)";
+      const corrText = r.correctIdx >= 0
+        ? `${letters[r.correctIdx]}) ${escapeHtml(r.options[r.correctIdx])}` : "—";
+      out += `
+        <div class="sec-card" style="margin-bottom:12px">
+          ${r.title ? `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);margin-bottom:6px">${escapeHtml(r.title)}</div>` : ""}
+          <div style="font-family:var(--serif);margin-bottom:10px">${r.prompt}</div>
+          <div class="row"><span class="dim">Tu respuesta</span>
+            <span class="v" style="color:var(--danger,#b3423f)">${selText}</span></div>
+          <div class="row"><span class="dim">Respuesta correcta</span>
+            <span class="v" style="color:var(--accent)">${corrText}</span></div>
+          ${sel !== null && r.selectedRationale ? `<div style="font-size:13px;color:var(--ink-dim);margin-top:8px">✗ Por qué tu opción era incorrecta: ${escapeHtml(r.selectedRationale)}</div>` : ""}
+          ${r.correctRationale ? `<div style="font-size:13px;color:var(--ink-dim);margin-top:6px">✓ ${escapeHtml(r.correctRationale)}</div>` : ""}
+          ${r.script ? `
+            <details style="margin-top:10px">
+              <summary style="cursor:pointer;font-size:13px;color:var(--ink-dim)">📜 Ver transcripción del audio</summary>
+              <div style="font-family:var(--serif);font-size:13px;color:var(--ink-dim);margin-top:8px;padding:10px;background:rgba(0,0,0,.03);border-radius:8px">${escapeHtml(r.script)}</div>
+            </details>` : ""}
+        </div>`;
+    }
+  }
+
+  return `
+    <div class="card">
+      <div class="card-h">
+        <h3>Revisión de errores</h3>
+        <small class="meta">${session.reviewItems.length} pregunta${session.reviewItems.length!==1?'s':''}</small>
+      </div>
+      <p style="font-size:13px;color:var(--ink-dim);margin-bottom:8px">
+        Solo se muestran las preguntas que respondiste mal o dejaste sin responder. Las transcripciones de audio se revelan aquí porque el examen ya terminó.
+      </p>
+      ${out}
+      <div style="margin-top:16px">
+        <button class="btn secondary" onclick="toggleErrorReview()">Ocultar revisión</button>
+      </div>
+    </div>`;
 }
 
 function renderWritingEvaluation(ev){
@@ -3379,8 +4553,23 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireNavigationControls();
   initSupabase();
   await refreshAuth();
-  await clearExamDraft();
   await renderHistory();
+  // v4: si hay una sesión sin terminar, avisar al alumno al entrar.
+  const draft = await loadExamDraft();
+  if(draft?.started){
+    toast("Tienes un examen en progreso. Puedes continuarlo desde el inicio.", "success");
+  }
+});
+
+/* v4 · Guardado de seguridad: si el alumno cambia de pestaña, minimiza o
+ * cierra el navegador a mitad del examen, el borrador queda al día. */
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "hidden" && state?.items?.length && state?.startTime){
+    saveExamDraft();
+  }
+});
+window.addEventListener("pagehide", () => {
+  if(state?.items?.length && state?.startTime){ saveExamDraft(); }
 });
 
 </script>
